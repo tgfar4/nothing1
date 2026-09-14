@@ -1,0 +1,154 @@
+name: "----"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-automation:
+    name: "Display"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: 1. Initialize Secrets & Session Data
+        env:
+          SECRET_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+        run: |
+          # 1. Mask secrets from log outputs immediately
+          echo "::add-mask::$SECRET_SESSION"
+          echo "::add-mask::$R2_SECRET_KEY"
+
+          echo "[*] Verifying required GitHub Action Secrets..."
+          if [ -z "$SECRET_SESSION" ]; then
+            echo "::error::GitHub Secret 'TELEGRAM_SESSION' is missing! Please configure it under Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          if [ -z "$R2_SECRET_KEY" ]; then
+            echo "::error::GitHub Secret 'R2_SECRET_KEY' is missing! Please configure it under Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+          # Reconstruct session.dat safely without printing to stdout
+          printf "%s\n" "$SECRET_SESSION" > session.dat
+          chmod 600 session.dat
+          echo "[+] Successfully initialized session.dat and validated secrets."
+
+      - name: 2. Download & Extract Code Bundle from Cloudflare R2
+        env:
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+        run: |
+          BUNDLE_URL="https://tgc.m-jihad3k.workers.dev/bundle.zip"
+          echo "[*] Downloading project bundle securely from Cloudflare R2..."
+
+          HEADER_CONF=$(mktemp)
+          chmod 600 "$HEADER_CONF"
+          printf 'header = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"\nheader = "Authorization: Bearer %s"\nheader = "X-Custom-Auth: %s"\n' "$R2_SECRET_KEY" "$R2_SECRET_KEY" > "$HEADER_CONF"
+
+          # Download bundle with fallback query parameter if needed
+          HTTP_STATUS=$(curl -s -w "%{http_code}" --config "$HEADER_CONF" "$BUNDLE_URL?key=$R2_SECRET_KEY" -o bundle.zip)
+          rm -f "$HEADER_CONF"
+
+          echo "[*] Download response HTTP status: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" -eq 200 ] && [ -s bundle.zip ]; then
+            # Verify valid zip format before extracting
+            if unzip -t -q bundle.zip; then
+              echo "[+] Successfully downloaded valid bundle.zip. Extracting files..."
+              unzip -q -o bundle.zip
+              rm -f bundle.zip
+              echo "[+] Extraction complete. Project files ready."
+            else
+              echo "::error::Downloaded bundle.zip is not a valid zip archive!"
+              head -n 20 bundle.zip
+              exit 1
+            fi
+          else
+            echo "::error::Failed to download bundle.zip (HTTP Status: $HTTP_STATUS). Response content:"
+            cat bundle.zip 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: 3. Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 4. Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: 5. Install System GUI, VNC & Google Chrome
+        run: |
+          sudo apt-get update
+          # Upgrade Google Chrome to latest version
+          sudo apt-get --only-upgrade install -y google-chrome-stable || sudo apt-get install -y google-chrome-stable
+          # Install Xvfb, VNC, noVNC and GUI tools
+          sudo apt-get install -y xvfb x11vnc novnc python3-websockify fluxbox
+          # Ensure direct link for index.html
+          sudo ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
+          # Verify Google Chrome version
+          google-chrome --version
+
+      - name: 6. Install cloudflared (Cloudflare Tunnel)
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: 7. Run Telegram Automation with Live Cloudflare GUI Stream
+        env:
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          # 1. Start virtual desktop Xvfb on display :99
+          echo "[*] Starting Xvfb virtual desktop (1920x1080 24-bit color on :99)..."
+          Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
+          export DISPLAY=:99
+          sleep 2
+
+          # 2. Start lightweight window manager
+          fluxbox &
+          sleep 1
+
+          # 3. Start x11vnc to share display :99 over VNC (port 5900)
+          echo "[*] Starting x11vnc server on port 5900..."
+          x11vnc -display :99 -forever -shared -nopw -listen 127.0.0.1 -rfbport 5900 -bg
+
+          # 4. Start noVNC (websockify bridge to HTML5 VNC client on port 6080)
+          echo "[*] Starting noVNC web server on port 6080..."
+          websockify --web /usr/share/novnc 6080 127.0.0.1:5900 &
+          sleep 2
+
+          # 5. Launch Cloudflare Quick Tunnel to expose port 6080 publicly
+          echo "[*] Launching Cloudflare Tunnel for live browser GUI access..."
+          cloudflared tunnel --url http://127.0.0.1:6080 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+
+          # Wait for Cloudflare Tunnel URL to be generated
+          GUI_URL=""
+          for i in {1..20}; do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              GUI_URL="$TUNNEL_URL/vnc.html?autoconnect=true&resize=scale"
+              break
+            fi
+            sleep 1
+          done
+
+          echo "=================================================================="
+          if [ -n "$GUI_URL" ]; then
+            echo " [★] LIVE VIRTUAL DESKTOP GUI URL (OPEN IN ANY BROWSER):"
+            echo "     $GUI_URL"
+            echo "=================================================================="
+            echo "::notice title=Live Cloudflare GUI URL::$GUI_URL"
+          else
+            echo " [!] Cloudflare Tunnel URL is generating in background. Check /tmp/cloudflared.log."
+            echo "=================================================================="
+          fi
+
+          echo "[*] Launching Chrome in full virtual GUI desktop (Dynamic config from chvisit.json)..."
+          python run_session.py
