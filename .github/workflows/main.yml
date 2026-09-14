@@ -10,7 +10,7 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: 1. Initialize Secrets & Session Data
+      - name: 1. Initializen Data
         env:
           SECRET_SESSION: ${{ secrets.TELEGRAM_SESSION }}
           R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
